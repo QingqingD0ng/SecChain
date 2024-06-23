@@ -11,12 +11,14 @@ from gradio.themes.utils.colors import slate  # type: ignore
 from injector import inject, singleton
 from pydantic import BaseModel
 import PyPDF2
+from fpdf import FPDF
+import json
 
 from private_gpt.constants import PROJECT_ROOT_PATH
 from private_gpt.di import global_injector
 from private_gpt.server.chunks.chunks_service import Chunk, ChunksService
 from private_gpt.server.ingest.ingest_service import IngestService
-from private_gpt.server.chat.chat_service import ChatService, ChatMessage, MessageRole
+from private_gpt.server.chat.chat_service import ChatService, ChatMessage, MessageRole, CompletionGen
 from private_gpt.settings.settings import settings
 from private_gpt.ui.images import logo_svg
 
@@ -25,7 +27,8 @@ logger = logging.getLogger(__name__)
 THIS_DIRECTORY_RELATIVE = Path(__file__).parent.relative_to(PROJECT_ROOT_PATH)
 AVATAR_BOT = THIS_DIRECTORY_RELATIVE / "avatar-bot.ico"
 
-UI_TAB_TITLE = "SecChain GPT"
+UI_TAB_TITLE = "Hydac SecChain GPT"
+SOURCES_SEPARATOR = "\n\n Sources: \n"
 
 class Source(BaseModel):
     file: str
@@ -71,6 +74,8 @@ class PrivateGptUi:
         self._ui_block = None
 
         self._selected_filename = None
+        self.questions = []
+        self.answers = []
 
     def _parse_pdf(self, file: Any) -> str:
         if file is None or not file.name.endswith('.pdf'):
@@ -82,24 +87,71 @@ class PrivateGptUi:
             text = ''
             for page_num in range(len(reader.pages)):
                 text += reader.pages[page_num].extract_text()
-         
+
         return text
 
-    def _extract_questions(self, text: str) -> str:
-        # Use the local chat service to extract questions
-        
-        logging.info(" _extract_questions",text)
-        messages = [ChatMessage(content=text, role=MessageRole.USER)]
-        completion_gen = self._chat_service.stream_chat(messages=messages, use_context=False)
-        
-        questions = ""
-        for delta in completion_gen.response:
+    def yield_deltas(self, completion_gen: CompletionGen) -> Iterable[str]:
+        full_response: str = ""
+        stream = completion_gen.response
+        for delta in stream:
             if isinstance(delta, str):
-                questions += delta
+                full_response += str(delta)
             elif isinstance(delta, ChatResponse):
-                questions += delta.delta or ""
-        
-        return questions.strip()
+                full_response += delta.delta or ""
+            yield full_response
+            time.sleep(0.02)
+
+        if completion_gen.sources:
+            full_response += SOURCES_SEPARATOR
+            cur_sources = Source.curate_sources(completion_gen.sources)
+            sources_text = "\n\n\n"
+            used_files = set()
+            for index, source in enumerate(cur_sources, start=1):
+                if f"{source.file}-{source.page}" not in used_files:
+                    sources_text = (
+                        sources_text
+                        + f"{index}. {source.file} (page {source.page}) \n\n"
+                    )
+                    used_files.add(f"{source.file}-{source.page}")
+            full_response += sources_text
+        yield full_response
+
+    def _extract_questions(self, text: str) -> list[str]:
+        # Use the local chat service to extract questions
+        prompt = "Extract all questions from the following text, return a json string of the question list. Example: ['sind Richtlinien zur Informationssicherheit vorhanden?','werden Informationssicherheitsrisiken gemanagt?']"
+        messages = [
+            ChatMessage(content=prompt, role=MessageRole.ASSISTANT),
+            ChatMessage(content=text, role=MessageRole.USER)
+        ]
+        completion = self._chat_service.chat(messages=messages, use_context=False)
+        extracted_questions = completion.response
+        return json.loads(extracted_questions)  # Remove duplicates
+
+    def _answer_question(self, question: str) -> Iterable[str]:
+        prompt = '''
+    Instruction: You are an IT security expert for a famous German company called Hydac.
+    Given the question and related context, generate a short, clear, and professional response in German.
+    You can refer to the example give below -----
+    Question: Inwieweit werden alle Mitarbeiter zur Einhaltung der Informationssicherheit verpflichtet?
+    Context: 2.1.2 Inwieweit werden alle Mitarbeiter zur Einhaltung der Informationssicherheit verpflichtet?
+    Detaillierte Sachverhaltsdarstellung (inkl. Beurteilungsverfahren) Betrachtete Dokumente/Nachweise/Prüfungshandlung:
+    Datengeheimnis Arbeitsvertrag,  IT-SRL, Vorlagen  Datenschutz Statement Hydac: Im Arbeitsvertrag wird auf die Einhaltung
+    von Verfahrensanweisungen und im Unternehmen geltenden Richtlinien sowie Geheimhaltung verpflichtet. Mit Abschluss des Arbeitsvertrages 
+    erhält der Mitarbeiter eine Erklärung zum Datengeheimnis, die er mit dem Unterzeichnen einwilligt. Weitere Verpflichtungen zur Geheimhaltung 
+    können je nach Berufsgruppe bestehen und werden durch den Zentralbereich Datenschutz ausgegeben. Die IT-SRL ist eine Verfahrensanweisung 
+    und somit für alle Mitarbeiter bindend. Mitarbeiter werden zur Geheimhaltung und auf das Regelwerk zur Informationssicherheit verpflichtet. 
+    Feststellung Auf Basis der Beobachtungen wurde keine Abweichung festgestellt. 
+    Answer: Im Arbeitsvertrag wird auf die Einhaltung von Verfahrensanweisungen und im Unternehmen geltenden Richtlinien sowie Geheimhaltung 
+    verpflichtet. Mit Abschluss des Arbeitsvertrages erhält der Mitarbeiter eine Erklärung zum Datengeheimnis, die er mit dem Unterzeichnen einwilligt. 
+    Weitere Verpflichtungen zur Geheimhaltung können je nach Berufsgruppe bestehen und werden durch den Zentralbereich Datenschutz ausgegeben. 
+    Die IT-SRL ist eine Verfahrensanweisung und somit für alle Mitarbeiter bindend Mitarbeiter werden zur Geheimhaltung und auf das Regelwerk zur Informationssicherheit verpflichtet..
+'''
+        messages = [
+            ChatMessage(content=prompt, role=MessageRole.ASSISTANT),
+            ChatMessage(content=question, role=MessageRole.USER)
+        ]
+        completion = self._chat_service.chat(messages=messages, use_context=True)
+        return completion.response
 
     def _process_upload(self, file: Any) -> str:
         # Check file format
@@ -108,11 +160,28 @@ class PrivateGptUi:
 
         # Parse the PDF to extract text
         text = self._parse_pdf(file)
-        
+
         # Extract questions using the local chat service
-        questions = self._extract_questions(text)
+        self.questions = self._extract_questions(text)
         
-        return questions
+        return "\n".join(self.questions)
+
+    def _answer_questionnaire(self) -> str:
+        self.answers = []
+        for question in self.questions:
+            answer = list(self._answer_question(question))
+            self.answers.append((question, answer))
+        return "\n".join([f"Q: {q}\nA: {''.join(a)}\n\n" for q, a in self.answers])
+
+    def _generate_pdf(self) -> str:
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        for question, answer in self.answers:
+            pdf.multi_cell(0, 10, f"Q: {question}\nA: {''.join(answer)}\n\n")
+        output_path = "/mnt/data/filled_questionnaire.pdf"
+        pdf.output(output_path)
+        return output_path
 
     def _list_ingested_files(self) -> list[list[str]]:
         files = set()
@@ -207,15 +276,16 @@ class PrivateGptUi:
             "align-content: center;"
             "justify-content: center;"
             "align-items: center;"
+            "color: white;"  # Change font color to white
             "}"
-            ".logo img { height: 25% }"
+            ".logo img { height: 0% }"
             ".contain { display: flex !important; flex-direction: column !important; }"
             "#component-0, #component-3, #component-10, #component-8  { height: 100% !important; }"
             "#chatbot { flex-grow: 1 !important; overflow: auto !important;}"
             "#col { height: calc(100vh - 112px - 16px) !important; }",
         ) as blocks:
             with gr.Row():
-                gr.HTML(f"<div class='logo'/><img src={logo_svg} alt='SecChain GPT'></div")
+                gr.HTML(f"<div class='logo'><img src={logo_svg} alt='Hydac SecChain GPT'><h1 style='color: white;'>Hydac SecChain GPT</h1></div>")
 
             with gr.Row(equal_height=False):
                 with gr.Column(scale=3):
@@ -298,7 +368,13 @@ class PrivateGptUi:
                 with gr.Column(scale=7, elem_id="col"):
                     upload_questionnaire_button = gr.File(label="Upload Questionnaire PDF", type="filepath")
                     questionnaire_output = gr.Textbox(label="Extracted Questions", lines=20)
+                    answer_button = gr.Button("Answer Questionnaire")
+                    download_button = gr.Button("Download Filled Questionnaire", visible=False)
+                    download_link = gr.File()
+
                     upload_questionnaire_button.upload(fn=self._process_upload, inputs=upload_questionnaire_button, outputs=questionnaire_output)
+                    answer_button.click(fn=self._answer_questionnaire, outputs=questionnaire_output)
+                    download_button.click(fn=self._generate_pdf, outputs=download_link)
 
         return blocks
 
