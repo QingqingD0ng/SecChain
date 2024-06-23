@@ -1,5 +1,3 @@
-"""This file should be imported if and only if you want to run the UI locally."""
-
 import itertools
 import logging
 import time
@@ -11,30 +9,23 @@ import gradio as gr  # type: ignore
 from fastapi import FastAPI
 from gradio.themes.utils.colors import slate  # type: ignore
 from injector import inject, singleton
-from llama_index.core.llms import ChatMessage, ChatResponse, MessageRole
 from pydantic import BaseModel
+import PyPDF2
 
 from private_gpt.constants import PROJECT_ROOT_PATH
 from private_gpt.di import global_injector
-from private_gpt.open_ai.extensions.context_filter import ContextFilter
-from private_gpt.server.chat.chat_service import ChatService, CompletionGen
 from private_gpt.server.chunks.chunks_service import Chunk, ChunksService
 from private_gpt.server.ingest.ingest_service import IngestService
+from private_gpt.server.chat.chat_service import ChatService, ChatMessage, MessageRole
 from private_gpt.settings.settings import settings
 from private_gpt.ui.images import logo_svg
 
 logger = logging.getLogger(__name__)
 
 THIS_DIRECTORY_RELATIVE = Path(__file__).parent.relative_to(PROJECT_ROOT_PATH)
-# Should be "private_gpt/ui/avatar-bot.ico"
 AVATAR_BOT = THIS_DIRECTORY_RELATIVE / "avatar-bot.ico"
 
-UI_TAB_TITLE = "My Private GPT"
-
-SOURCES_SEPARATOR = "\n\n Sources: \n"
-
-MODES = ["Query Files", "Search Files", "LLM Chat (no context from files)"]
-
+UI_TAB_TITLE = "SecChain GPT"
 
 class Source(BaseModel):
     file: str
@@ -69,152 +60,59 @@ class PrivateGptUi:
     def __init__(
         self,
         ingest_service: IngestService,
-        chat_service: ChatService,
         chunks_service: ChunksService,
+        chat_service: ChatService,
     ) -> None:
         self._ingest_service = ingest_service
-        self._chat_service = chat_service
         self._chunks_service = chunks_service
+        self._chat_service = chat_service
 
         # Cache the UI blocks
         self._ui_block = None
 
         self._selected_filename = None
 
-        # Initialize system prompt based on default mode
-        self.mode = MODES[0]
-        self._system_prompt = self._get_default_system_prompt(self.mode)
+    def _parse_pdf(self, file: Any) -> str:
+        if file is None or not file.name.endswith('.pdf'):
+            return "Please only upload PDF files."
 
-    def _chat(self, message: str, history: list[list[str]], mode: str, *_: Any) -> Any:
-        def yield_deltas(completion_gen: CompletionGen) -> Iterable[str]:
-            full_response: str = ""
-            stream = completion_gen.response
-            for delta in stream:
-                if isinstance(delta, str):
-                    full_response += str(delta)
-                elif isinstance(delta, ChatResponse):
-                    full_response += delta.delta or ""
-                yield full_response
-                time.sleep(0.02)
+        # Parse the PDF
+        with open(file.name, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            text = ''
+            for page_num in range(len(reader.pages)):
+                text += reader.pages[page_num].extract_text()
+         
+        return text
 
-            if completion_gen.sources:
-                full_response += SOURCES_SEPARATOR
-                cur_sources = Source.curate_sources(completion_gen.sources)
-                sources_text = "\n\n\n"
-                used_files = set()
-                for index, source in enumerate(cur_sources, start=1):
-                    if f"{source.file}-{source.page}" not in used_files:
-                        sources_text = (
-                            sources_text
-                            + f"{index}. {source.file} (page {source.page}) \n\n"
-                        )
-                        used_files.add(f"{source.file}-{source.page}")
-                full_response += sources_text
-            yield full_response
+    def _extract_questions(self, text: str) -> str:
+        # Use the local chat service to extract questions
+        
+        logging.info(" _extract_questions",text)
+        messages = [ChatMessage(content=text, role=MessageRole.USER)]
+        completion_gen = self._chat_service.stream_chat(messages=messages, use_context=False)
+        
+        questions = ""
+        for delta in completion_gen.response:
+            if isinstance(delta, str):
+                questions += delta
+            elif isinstance(delta, ChatResponse):
+                questions += delta.delta or ""
+        
+        return questions.strip()
 
-        def build_history() -> list[ChatMessage]:
-            history_messages: list[ChatMessage] = list(
-                itertools.chain(
-                    *[
-                        [
-                            ChatMessage(content=interaction[0], role=MessageRole.USER),
-                            ChatMessage(
-                                # Remove from history content the Sources information
-                                content=interaction[1].split(SOURCES_SEPARATOR)[0],
-                                role=MessageRole.ASSISTANT,
-                            ),
-                        ]
-                        for interaction in history
-                    ]
-                )
-            )
+    def _process_upload(self, file: Any) -> str:
+        # Check file format
+        if not file.name.endswith('.pdf'):
+            return "Please only upload PDF files."
 
-            # max 20 messages to try to avoid context overflow
-            return history_messages[:20]
-
-        new_message = ChatMessage(content=message, role=MessageRole.USER)
-        all_messages = [*build_history(), new_message]
-        # If a system prompt is set, add it as a system message
-        if self._system_prompt:
-            all_messages.insert(
-                0,
-                ChatMessage(
-                    content=self._system_prompt,
-                    role=MessageRole.SYSTEM,
-                ),
-            )
-        match mode:
-            case "Query Files":
-
-                # Use only the selected file for the query
-                context_filter = None
-                if self._selected_filename is not None:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
-
-                query_stream = self._chat_service.stream_chat(
-                    messages=all_messages,
-                    use_context=True,
-                    context_filter=context_filter,
-                )
-                yield from yield_deltas(query_stream)
-            case "LLM Chat (no context from files)":
-                llm_stream = self._chat_service.stream_chat(
-                    messages=all_messages,
-                    use_context=False,
-                )
-                yield from yield_deltas(llm_stream)
-
-            case "Search Files":
-                response = self._chunks_service.retrieve_relevant(
-                    text=message, limit=4, prev_next_chunks=0
-                )
-
-                sources = Source.curate_sources(response)
-
-                yield "\n\n\n".join(
-                    f"{index}. **{source.file} "
-                    f"(page {source.page})**\n "
-                    f"{source.text}"
-                    for index, source in enumerate(sources, start=1)
-                )
-
-    # On initialization and on mode change, this function set the system prompt
-    # to the default prompt based on the mode (and user settings).
-    @staticmethod
-    def _get_default_system_prompt(mode: str) -> str:
-        p = ""
-        match mode:
-            # For query chat mode, obtain default system prompt from settings
-            case "Query Files":
-                p = settings().ui.default_query_system_prompt
-            # For chat mode, obtain default system prompt from settings
-            case "LLM Chat (no context from files)":
-                p = settings().ui.default_chat_system_prompt
-            # For any other mode, clear the system prompt
-            case _:
-                p = ""
-        return p
-
-    def _set_system_prompt(self, system_prompt_input: str) -> None:
-        logger.info(f"Setting system prompt to: {system_prompt_input}")
-        self._system_prompt = system_prompt_input
-
-    def _set_current_mode(self, mode: str) -> Any:
-        self.mode = mode
-        self._set_system_prompt(self._get_default_system_prompt(mode))
-        # Update placeholder and allow interaction if default system prompt is set
-        if self._system_prompt:
-            return gr.update(placeholder=self._system_prompt, interactive=True)
-        # Update placeholder and disable interaction if no default system prompt is set
-        else:
-            return gr.update(placeholder=self._system_prompt, interactive=False)
+        # Parse the PDF to extract text
+        text = self._parse_pdf(file)
+        
+        # Extract questions using the local chat service
+        questions = self._extract_questions(text)
+        
+        return questions
 
     def _list_ingested_files(self) -> list[list[str]]:
         files = set()
@@ -228,9 +126,9 @@ class PrivateGptUi:
             files.add(file_name)
         return [[row] for row in files]
 
-    def _upload_file(self, files: list[str]) -> None:
+    def _upload_file(self, files: list[Any]) -> None:
         logger.debug("Loading count=%s files", len(files))
-        paths = [Path(file) for file in files]
+        paths = [Path(file.name) for file in files]
 
         # remove all existing Documents with name identical to a new file upload:
         file_names = [path.name for path in paths]
@@ -238,7 +136,8 @@ class PrivateGptUi:
         for ingested_document in self._ingest_service.list_ingested():
             if (
                 ingested_document.doc_metadata
-                and ingested_document.doc_metadata["file_name"] in file_names
+                and ingested_document.doc_metadata["file_name"]
+                in file_names
             ):
                 doc_ids_to_delete.append(ingested_document.doc_id)
         if len(doc_ids_to_delete) > 0:
@@ -265,7 +164,6 @@ class PrivateGptUi:
 
     def _delete_selected_file(self) -> Any:
         logger.debug("Deleting selected %s", self._selected_filename)
-        # Note: keep looping for pdf's (each page became a Document)
         for ingested_document in self._ingest_service.list_ingested():
             if (
                 ingested_document.doc_metadata
@@ -303,7 +201,7 @@ class PrivateGptUi:
             theme=gr.themes.Soft(primary_hue=slate),
             css=".logo { "
             "display:flex;"
-            "background-color: #C7BAFF;"
+            "background-color: #A03232;"  # Change header color
             "height: 80px;"
             "border-radius: 8px;"
             "align-content: center;"
@@ -317,15 +215,10 @@ class PrivateGptUi:
             "#col { height: calc(100vh - 112px - 16px) !important; }",
         ) as blocks:
             with gr.Row():
-                gr.HTML(f"<div class='logo'/><img src={logo_svg} alt=PrivateGPT></div")
+                gr.HTML(f"<div class='logo'/><img src={logo_svg} alt='SecChain GPT'></div")
 
             with gr.Row(equal_height=False):
                 with gr.Column(scale=3):
-                    mode = gr.Radio(
-                        MODES,
-                        label="Mode",
-                        value="Query Files",
-                    )
                     upload_button = gr.components.UploadButton(
                         "Upload File(s)",
                         type="filepath",
@@ -401,81 +294,12 @@ class PrivateGptUi:
                             selected_text,
                         ],
                     )
-                    system_prompt_input = gr.Textbox(
-                        placeholder=self._system_prompt,
-                        label="System Prompt",
-                        lines=2,
-                        interactive=True,
-                        render=False,
-                    )
-                    # When mode changes, set default system prompt
-                    mode.change(
-                        self._set_current_mode, inputs=mode, outputs=system_prompt_input
-                    )
-                    # On blur, set system prompt to use in queries
-                    system_prompt_input.blur(
-                        self._set_system_prompt,
-                        inputs=system_prompt_input,
-                    )
-
-                    def get_model_label() -> str | None:
-                        """Get model label from llm mode setting YAML.
-
-                        Raises:
-                            ValueError: If an invalid 'llm_mode' is encountered.
-
-                        Returns:
-                            str: The corresponding model label.
-                        """
-                        # Get model label from llm mode setting YAML
-                        # Labels: local, openai, openailike, sagemaker, mock, ollama
-                        config_settings = settings()
-                        if config_settings is None:
-                            raise ValueError("Settings are not configured.")
-
-                        # Get llm_mode from settings
-                        llm_mode = config_settings.llm.mode
-
-                        # Mapping of 'llm_mode' to corresponding model labels
-                        model_mapping = {
-                            "llamacpp": config_settings.llamacpp.llm_hf_model_file,
-                            "openai": config_settings.openai.model,
-                            "openailike": config_settings.openai.model,
-                            "sagemaker": config_settings.sagemaker.llm_endpoint_name,
-                            "mock": llm_mode,
-                            "ollama": config_settings.ollama.llm_model,
-                        }
-
-                        if llm_mode not in model_mapping:
-                            print(f"Invalid 'llm mode': {llm_mode}")
-                            return None
-
-                        return model_mapping[llm_mode]
 
                 with gr.Column(scale=7, elem_id="col"):
-                    # Determine the model label based on the value of PGPT_PROFILES
-                    model_label = get_model_label()
-                    if model_label is not None:
-                        label_text = (
-                            f"LLM: {settings().llm.mode} | Model: {model_label}"
-                        )
-                    else:
-                        label_text = f"LLM: {settings().llm.mode}"
+                    upload_questionnaire_button = gr.File(label="Upload Questionnaire PDF", type="filepath")
+                    questionnaire_output = gr.Textbox(label="Extracted Questions", lines=20)
+                    upload_questionnaire_button.upload(fn=self._process_upload, inputs=upload_questionnaire_button, outputs=questionnaire_output)
 
-                    _ = gr.ChatInterface(
-                        self._chat,
-                        chatbot=gr.Chatbot(
-                            label=label_text,
-                            show_copy_button=True,
-                            elem_id="chatbot",
-                            render=False,
-                            avatar_images=(
-                                None,
-                                AVATAR_BOT,
-                            ),
-                        ),
-                        additional_inputs=[mode, upload_button, system_prompt_input],
-                    )
         return blocks
 
     def get_ui_blocks(self) -> gr.Blocks:
