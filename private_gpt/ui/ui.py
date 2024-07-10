@@ -117,6 +117,7 @@ class PrivateGptUi:
         yield full_response
 
     def _extract_questions(self, text: str) -> list[str]:
+        logger.info('Extracted questions from text: %s', text)
         # Use the local chat service to extract questions
         prompt = "Extract all questions from the following text, return a json string of the question list. Example: ['sind Richtlinien zur Informationssicherheit vorhanden?','werden Informationssicherheitsrisiken gemanagt?']"
         messages = [
@@ -124,7 +125,9 @@ class PrivateGptUi:
             ChatMessage(content=text, role=MessageRole.USER)
         ]
         completion = self._chat_service.chat(messages=messages, use_context=False)
+        logger.info('Extracted questions from chatmessage: %s', messages[1])
         extracted_questions = completion.response
+        logger.info('Extracted questions: %s', extracted_questions)
         return json.loads(extracted_questions)  # Remove duplicates
 
     def _answer_question(self, question: str) -> Iterable[str]:
